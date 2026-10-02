@@ -163,7 +163,7 @@ setup script there.
 
 ## Limits
 
-- No resolution of monorepo workspace packages yet. Only the root `tsconfig`/`jsconfig` paths are read.
+- Imports resolve through the nearest `tsconfig`/`jsconfig` (`paths`, `baseUrl`, relative `extends`) and workspace packages (any `package.json` in the repo, by `name` and `exports`/`main`; built `dist/` entries fall back to `src/`). Package `extends` (e.g. `@tsconfig/node20`) and TS project references are not followed.
 - No Go, Rust, PHP or Java parsers yet. Those files get path, history and facts, but no exports or imports.
 - Search (`q`) is lexical. Files without a purpose can be missed on purely semantic requests, which is what `sync` fixes.
 - The `--api` runner is implemented but untested. All measurements used the `claude` CLI.

@@ -534,18 +534,108 @@ NODE_BUILTIN = set('assert buffer child_process cluster crypto dgram dns events 
                    'worker_threads zlib async_hooks module'.split())
 
 class Resolver:
+    """Import resolution: relative paths, tsconfig/jsconfig `paths` + `baseUrl` (the nearest config up from
+    each file, `extends` followed), and workspace packages (any package.json in the repo, by its `name`,
+    entry from `exports` / `types` / `module` / `main`, else src/index or index)."""
     def __init__(self, repo, files):
-        self.files = set(files)
-        tc = load_jsonish(os.path.join(repo, 'tsconfig.json')) or load_jsonish(os.path.join(repo, 'jsconfig.json'))
-        co = tc.get('compilerOptions', {}) if isinstance(tc, dict) else {}
-        self.base = (co.get('baseUrl') or '').strip('./')
-        self.alias = []
-        for k, v in (co.get('paths') or {}).items():
-            if not v: continue
-            tgt = os.path.normpath(os.path.join(self.base, v[0].rstrip('*'))).replace('\\', '/')
-            tgt = '' if tgt == '.' else tgt + '/'
-            self.alias.append((k.rstrip('*'), tgt, k.endswith('*')))
-        self.alias.sort(key=lambda a: -len(a[0]))
+        self.repo, self.files = repo, set(files)
+        self._cfg = {}
+        self.pkgs = {}
+        for f in sorted(self.files):
+            if os.path.basename(f) != 'package.json': continue
+            pj = load_jsonish(os.path.join(repo, f))
+            name = pj.get('name') if isinstance(pj, dict) else None
+            if isinstance(name, str) and name and name not in self.pkgs:
+                d = os.path.dirname(f)
+                self.pkgs[name] = (d + '/' if d else '', pj)
+        self.pkg_names = sorted(self.pkgs, key=len, reverse=True)
+
+    def _read_cfg(self, path, depth=0):
+        """compilerOptions of one tsconfig with its relative `extends` chain merged; paths made repo-relative."""
+        tc = load_jsonish(os.path.join(self.repo, path))
+        if not isinstance(tc, dict): return {}
+        d = os.path.dirname(path)
+        out = {}
+        ext = tc.get('extends')
+        for e in ([ext] if isinstance(ext, str) else ext if isinstance(ext, list) else []):
+            if depth < 5 and isinstance(e, str) and e.startswith('.'):
+                ep = os.path.normpath(os.path.join(d, e if e.endswith('.json') else e + '.json')).replace('\\', '/')
+                out.update(self._read_cfg(ep, depth + 1))
+        co = tc.get('compilerOptions') or {}
+        if not isinstance(co, dict): co = {}
+        if isinstance(co.get('baseUrl'), str):
+            out['base'] = os.path.normpath(os.path.join(d, co['baseUrl'])).replace('\\', '/')
+        if isinstance(co.get('paths'), dict):
+            out['paths'] = co['paths']
+            out['pbase'] = out.get('base', os.path.normpath(d or '.').replace('\\', '/'))
+        return out
+
+    def _config(self, d):
+        """Aliases for a directory: from the nearest tsconfig.json / jsconfig.json at or above it."""
+        if d in self._cfg: return self._cfg[d]
+        cfg = None
+        for name in ('tsconfig.json', 'jsconfig.json'):
+            p = (d + '/' if d else '') + name
+            if p in self.files or os.path.isfile(os.path.join(self.repo, p)):
+                cfg = self._read_cfg(p); break
+        if cfg is None:
+            cfg = self._config(os.path.dirname(d)) if d else {'alias': [], 'base': None}
+        elif 'alias' not in cfg:
+            alias = []
+            pb = cfg.get('pbase', '.')
+            for k, v in (cfg.get('paths') or {}).items():
+                if not v or not isinstance(v[0], str): continue
+                tgt = os.path.normpath(os.path.join(pb, v[0].rstrip('*'))).replace('\\', '/')
+                tgt = '' if tgt == '.' else tgt + ('/' if v[0].endswith('*') else '')
+                alias.append((k.rstrip('*'), tgt, k.endswith('*')))
+            alias.sort(key=lambda a: -len(a[0]))
+            base = cfg.get('base')
+            cfg = {'alias': alias, 'base': None if base is None else ('' if base == '.' else base)}
+        self._cfg[d] = cfg
+        return cfg
+
+    def _entry(self, val):
+        """First file path in an `exports` value (string, conditions object or array)."""
+        if isinstance(val, str): return val
+        if isinstance(val, list):
+            for v in val:
+                r = self._entry(v)
+                if r: return r
+        if isinstance(val, dict):
+            for k in ('types', 'source', 'import', 'module', 'default', 'require', 'node'):
+                if k in val:
+                    r = self._entry(val[k])
+                    if r: return r
+            for v in val.values():
+                r = self._entry(v)
+                if r: return r
+        return None
+
+    def _pkg(self, spec):
+        for name in self.pkg_names:
+            if spec == name or spec.startswith(name + '/'):
+                d, pj = self.pkgs[name]
+                sub = spec[len(name):]  # '' or '/x'
+                cands = []
+                ex = pj.get('exports')
+                key = '.' + sub
+                if isinstance(ex, dict) and any(k.startswith('.') for k in ex):
+                    if key in ex: cands.append(self._entry(ex[key]))
+                    for k, v in ex.items():  # "./*" patterns
+                        if '*' in k and key.startswith(k.split('*')[0]):
+                            e = self._entry(v)
+                            if e: cands.append(e.replace('*', key[len(k.split('*')[0]):]))
+                elif ex is not None and not sub: cands.append(self._entry(ex))
+                if not sub: cands += [pj.get(k) for k in ('types', 'typings', 'source', 'module', 'main')]
+                cands += [('src' + sub) if sub else 'src/index', sub.lstrip('/') or 'index']
+                for c in cands:
+                    if not isinstance(c, str): continue
+                    hit = self._try(d + c.removeprefix('./'))
+                    if not hit and re.match(r'\.?/?(dist|build|lib|out)/', c):  # built output: try the source
+                        hit = self._try(d + re.sub(r'^\.?/?(dist|build|lib|out)/', 'src/', c))
+                    if hit: return hit
+                return None
+        return False
 
     def _try(self, base):
         base = os.path.normpath(base).replace('\\', '/')
@@ -560,14 +650,19 @@ class Resolver:
     def ts(self, spec, fpath):
         if spec.startswith('.'):
             return self._try(os.path.join(os.path.dirname(fpath), spec)), None
-        for pre, tgt, wild in self.alias:
+        cfg = self._config(os.path.dirname(fpath))
+        for pre, tgt, wild in cfg['alias']:
             if (wild and spec.startswith(pre)) or spec == pre:
-                return self._try(tgt + spec[len(pre):] if wild else tgt.rstrip('/')), None
-        if self.base or self.base == '':
-            hit = self._try(os.path.join(self.base, spec)) if self.base else None
+                hit = self._try(tgt + spec[len(pre):] if wild else tgt.rstrip('/'))
+                if hit: return hit, None
+        if cfg['base'] is not None:
+            hit = self._try(os.path.join(cfg['base'], spec))
             if hit: return hit, None
-        if spec.startswith(('@/', '~/', '#')): return None, None
         spec = spec.removeprefix('node:')
+        hit = self._pkg(spec)
+        if hit: return hit, None
+        if hit is None: return None, None  # a workspace package, but no file found: not external either
+        if spec.startswith(('@/', '~/', '#')): return None, None
         pkg = '/'.join(spec.split('/')[:2]) if spec.startswith('@') else spec.split('/')[0]
         return None, (None if pkg in NODE_BUILTIN else pkg)
 
