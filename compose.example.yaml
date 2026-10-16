@@ -1,0 +1,13 @@
+# ctx service next to the app that calls it. Keep it on an internal network: no published port.
+services:
+  ctx:
+    build: .            # as a submodule: build: ./services/cg-tree
+    environment:
+      CTX_API_KEY: ${CTX_API_KEY:?set CTX_API_KEY}
+      # CTX_MAX_WORKTREES: 20
+      # CTX_FETCH_EVERY: 30
+    volumes:
+      - ctx-data:/data
+    restart: unless-stopped
+volumes:
+  ctx-data:

@@ -1,0 +1,4 @@
+.git
+.ctx
+**/__pycache__
+service/tests
